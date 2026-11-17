@@ -1,0 +1,26 @@
+{
+  "name": "agy-web-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Non-intrusive Chrome Extension and MCP Bridge for Antigravity (agy), modeled 1:1 on Claude in Chrome background tab & CDP automation.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run --exclude tests/e2e-chromium.test.ts",
+    "test:e2e": "npm run build && vitest run tests/e2e-chromium.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.313",
+    "@types/node": "^22.13.10",
+    "@types/ws": "^8.18.0",
+    "esbuild": "^0.25.1",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  }
+}
