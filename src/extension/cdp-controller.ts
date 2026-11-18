@@ -6,7 +6,7 @@ import {
 } from "../shared/cdp-input.js";
 import { redactSensitiveUrl } from "../shared/url-redact.js";
 
-export interface TabAudioFocusState {
+interface TabAudioFocusState {
   id: number;
   active: boolean;
   windowFocused: boolean;
@@ -33,13 +33,13 @@ export interface CdpTransport {
   onDetach: (listener: (tabId: number) => void) => void;
 }
 
-export interface ConsoleLogEntry {
+interface ConsoleLogEntry {
   type: string;
   text: string;
   timestamp: number;
 }
 
-export interface NetworkRequestEntry {
+interface NetworkRequestEntry {
   requestId: string;
   url: string;
   method: string;
@@ -50,7 +50,7 @@ export interface NetworkRequestEntry {
   errorText?: string;
 }
 
-export interface CapturedScreenshot {
+interface CapturedScreenshot {
   imageId: string;
   base64: string;
   mimeType: "image/png" | "image/jpeg";
@@ -62,6 +62,7 @@ export interface CapturedScreenshot {
 const MAX_CONSOLE_LOGS_PER_TAB = 10000;
 const MAX_NETWORK_REQS_PER_TAB = 1000;
 const MAX_CACHED_SCREENSHOTS = 32;
+const IDLE_DETACH_TIMEOUT_MS = 5000;
 
 function createBrowserCdpTransport(): CdpTransport {
   return {
@@ -196,6 +197,8 @@ export class CdpController {
   private readonly transport: CdpTransport;
   private readonly attachedTabs = new Set<number>();
   private readonly attachInFlight = new Map<number, Promise<void>>();
+  private readonly activeOperations = new Map<number, number>();
+  private readonly idleTimers = new Map<number, ReturnType<typeof setTimeout>>();
   private readonly mutedByUs = new Set<number>();
   private readonly consoleByTab = new Map<number, ConsoleLogEntry[]>();
   private readonly networkByTab = new Map<number, Map<string, NetworkRequestEntry>>();
@@ -213,12 +216,50 @@ export class CdpController {
       this.handleDebuggerEvent(tabId, method, params);
     });
     this.transport.onDetach((tabId) => {
+      this.clearIdleTimer(tabId);
       this.attachedTabs.delete(tabId);
       this.openDialogs.delete(tabId);
       if (this.mutedByUs.delete(tabId)) {
         void this.transport.setTabMuted(tabId, false).catch(() => undefined);
       }
     });
+  }
+
+  private clearIdleTimer(tabId: number): void {
+    const existing = this.idleTimers.get(tabId);
+    if (existing !== undefined) {
+      clearTimeout(existing);
+      this.idleTimers.delete(tabId);
+    }
+  }
+
+  private armIdleTimer(tabId: number): void {
+    this.clearIdleTimer(tabId);
+    if (!this.attachedTabs.has(tabId) || (this.activeOperations.get(tabId) ?? 0) > 0) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(tabId);
+      if ((this.activeOperations.get(tabId) ?? 0) === 0) {
+        void this.detachTab(tabId).catch(() => undefined);
+      }
+    }, IDLE_DETACH_TIMEOUT_MS);
+    this.idleTimers.set(tabId, timer);
+  }
+
+  private beginTabOperation(tabId: number): void {
+    this.clearIdleTimer(tabId);
+    this.activeOperations.set(tabId, (this.activeOperations.get(tabId) ?? 0) + 1);
+  }
+
+  private endTabOperation(tabId: number): void {
+    const remaining = (this.activeOperations.get(tabId) ?? 1) - 1;
+    if (remaining <= 0) {
+      this.activeOperations.delete(tabId);
+      this.armIdleTimer(tabId);
+    } else {
+      this.activeOperations.set(tabId, remaining);
+    }
   }
 
   private handleDebuggerEvent(
@@ -361,32 +402,48 @@ export class CdpController {
   }
 
   public async ensureAttached(tabId: number): Promise<void> {
-    if (this.attachedTabs.has(tabId)) {
-      return;
-    }
-    const inFlight = this.attachInFlight.get(tabId);
-    if (inFlight) {
-      return inFlight;
-    }
-
-    const promise = (async (): Promise<void> => {
-      try {
-        await this.transport.attach(tabId);
-        this.attachedTabs.add(tabId);
-        await this.transport.sendCommand(tabId, "Page.enable");
-        await this.transport.sendCommand(tabId, "Runtime.enable");
-        await this.transport.sendCommand(tabId, "Network.enable");
-        await this.maybeMuteBackgroundTab(tabId);
-        await this.transport.sendCommand(tabId, "Emulation.setFocusEmulationEnabled", {
-          enabled: true
-        });
-      } finally {
-        this.attachInFlight.delete(tabId);
+    this.beginTabOperation(tabId);
+    try {
+      if (this.attachedTabs.has(tabId)) {
+        return;
       }
-    })();
+      const inFlight = this.attachInFlight.get(tabId);
+      if (inFlight) {
+        await inFlight;
+        return;
+      }
 
-    this.attachInFlight.set(tabId, promise);
-    return promise;
+      const promise = (async (): Promise<void> => {
+        try {
+          await this.transport.attach(tabId);
+          this.attachedTabs.add(tabId);
+          await this.transport.sendCommand(tabId, "Page.enable");
+          await this.transport.sendCommand(tabId, "Runtime.enable");
+          await this.transport.sendCommand(tabId, "Network.enable");
+          await this.maybeMuteBackgroundTab(tabId);
+          await this.transport.sendCommand(tabId, "Emulation.setFocusEmulationEnabled", {
+            enabled: true
+          });
+        } finally {
+          this.attachInFlight.delete(tabId);
+        }
+      })();
+
+      this.attachInFlight.set(tabId, promise);
+      await promise;
+    } finally {
+      this.endTabOperation(tabId);
+    }
+  }
+
+  public async withAttachedTab<T>(tabId: number, fn: () => Promise<T>): Promise<T> {
+    this.beginTabOperation(tabId);
+    try {
+      await this.ensureAttached(tabId);
+      return await fn();
+    } finally {
+      this.endTabOperation(tabId);
+    }
   }
 
   public async sendCommand(
@@ -394,21 +451,27 @@ export class CdpController {
     method: string,
     params?: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
-    await this.ensureAttached(tabId);
+    this.beginTabOperation(tabId);
     try {
-      return await this.transport.sendCommand(tabId, method, params);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/debugger is not attached|detached while handling/i.test(msg)) {
-        this.attachedTabs.delete(tabId);
-        await this.ensureAttached(tabId);
-        return this.transport.sendCommand(tabId, method, params);
+      await this.ensureAttached(tabId);
+      try {
+        return await this.transport.sendCommand(tabId, method, params);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/debugger is not attached|detached while handling/i.test(msg)) {
+          this.attachedTabs.delete(tabId);
+          await this.ensureAttached(tabId);
+          return await this.transport.sendCommand(tabId, method, params);
+        }
+        throw err;
       }
-      throw err;
+    } finally {
+      this.endTabOperation(tabId);
     }
   }
 
   public async detachTab(tabId: number): Promise<void> {
+    this.clearIdleTimer(tabId);
     if (!this.attachedTabs.has(tabId)) {
       return;
     }
@@ -424,6 +487,17 @@ export class CdpController {
       await this.transport.setTabMuted(tabId, false).catch(() => undefined);
     }
     await this.transport.detach(tabId);
+  }
+
+  public async disposeTab(tabId: number): Promise<void> {
+    this.clearIdleTimer(tabId);
+    this.activeOperations.delete(tabId);
+    this.autoAcceptDialogTabs.delete(tabId);
+    this.openDialogs.delete(tabId);
+    this.consoleByTab.delete(tabId);
+    this.networkByTab.delete(tabId);
+    this.framesByTab.delete(tabId);
+    await this.detachTab(tabId);
   }
 
   public getOpenDialog(tabId: number): { type: string; message: string } | undefined {

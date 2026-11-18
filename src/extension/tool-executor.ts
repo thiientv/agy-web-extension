@@ -210,7 +210,7 @@ export class ToolExecutor {
     if (tabId === undefined) {
       return textResult("Parameter `tabId` is required.", true);
     }
-    await this.cdp.detachTab(tabId).catch(() => undefined);
+    await this.cdp.disposeTab(tabId).catch(() => undefined);
     const remaining = await this.tabGroups.closeTabInSession(tabId, scope);
     return textResult(
       `Closed tab ${tabId}. Remaining tabs in session group: ${
@@ -233,12 +233,7 @@ export class ToolExecutor {
     }
 
     const tab = await this.tabGroups.assertTabInSession(tabId, scope);
-    await this.cdp.ensureAttached(tabId).catch(() => undefined);
-    if (force) {
-      await this.cdp.setAutoAcceptBeforeUnload(tabId, true);
-    }
-
-    try {
+    const performNavigation = async (): Promise<McpToolCallResult> => {
       const normalized = normalizeNavigationUrl(rawUrl);
       if (normalized === "back") {
         await chrome.tabs.goBack(tabId);
@@ -275,11 +270,20 @@ export class ToolExecutor {
       return textResult(
         `Navigated tab ${tabId} to ${finalUrl} (title: ${JSON.stringify(updatedTab.title ?? "")})`
       );
-    } finally {
-      if (force) {
-        await this.cdp.setAutoAcceptBeforeUnload(tabId, false);
-      }
+    };
+
+    if (force && !isRestrictedBrowserUrl(tab.url)) {
+      return this.cdp.withAttachedTab(tabId, async () => {
+        await this.cdp.setAutoAcceptBeforeUnload(tabId, true);
+        try {
+          return await performNavigation();
+        } finally {
+          await this.cdp.setAutoAcceptBeforeUnload(tabId, false);
+        }
+      });
     }
+
+    return performNavigation();
   }
 
   private async handleReadPage(
@@ -377,7 +381,6 @@ export class ToolExecutor {
     }
 
     const tab = await this.tabGroups.assertTabInSession(tabId, scope);
-    await this.cdp.ensureAttached(tabId);
     const center = await resolveElementViewportCenter(tabId, ref, true);
     if (center.ok && center.x !== undefined && center.y !== undefined) {
       await this.tabGroups.showActiveVisualIndicator(tabId);
@@ -422,46 +425,12 @@ export class ToolExecutor {
       );
     }
 
-    await this.cdp.ensureAttached(tabId);
-
-    if (action === "screenshot" || action === "zoom") {
-      const scale = asNumber(args.scale);
-      const region = action === "zoom" ? asRegionQuad(args.region) : undefined;
-      if (action === "zoom" && !region) {
-        return textResult("Parameter `region` ([x0, y0, x1, y1]) is required for `zoom`.", true);
-      }
-
-      await this.tabGroups.hideIndicatorForScreenshot(tabId);
-      await sleepMs(35);
-      let shot;
-      try {
-        shot = await this.cdp.captureScreenshot(tabId, { region, scale });
-      } finally {
-        await this.tabGroups.restoreIndicatorAfterScreenshot(tabId);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Captured ${action} (imageId: ${shot.imageId}, coordinate_frame: ${shot.frame.screenshotWidth}x${shot.frame.screenshotHeight}, viewport: ${shot.frame.viewportWidth}x${shot.frame.viewportHeight}).`
-          },
-          {
-            type: "image",
-            data: shot.base64,
-            mimeType: shot.mimeType
-          }
-        ]
-      };
-    }
-
-    await this.tabGroups.showActiveVisualIndicator(tabId);
-
     if (action === "scroll_to") {
       const ref = typeof args.ref === "string" ? args.ref.trim() : "";
       if (!ref) {
         return textResult("Parameter `ref` is required for `scroll_to`.", true);
       }
+      await this.tabGroups.showActiveVisualIndicator(tabId);
       const box = await resolveElementViewportCenter(tabId, ref, true);
       if (!box.ok) {
         return textResult(box.error ?? `Failed to scroll to "${ref}".`, true);
@@ -469,129 +438,182 @@ export class ToolExecutor {
       return textResult(`Scrolled element [${ref}] into view at (${box.x}, ${box.y}).`);
     }
 
-    if (
-      action === "left_click" ||
-      action === "right_click" ||
-      action === "double_click" ||
-      action === "triple_click"
-    ) {
-      const target = await this.resolveActionTargetPoint(tabId, args);
-      if ("error" in target) {
-        return textResult(target.error, true);
-      }
+    const supportedCdpActions = new Set([
+      "screenshot",
+      "zoom",
+      "left_click",
+      "right_click",
+      "double_click",
+      "triple_click",
+      "hover",
+      "left_click_drag",
+      "scroll",
+      "type",
+      "key"
+    ]);
+    if (!supportedCdpActions.has(action)) {
+      return textResult(`Unsupported computer action: "${action}".`, true);
+    }
 
-      const button = action === "right_click" ? "right" : "left";
-      const clickCount =
-        action === "triple_click" ? 3 : action === "double_click" ? 2 : 1;
-      const modifiers = typeof args.modifiers === "string" ? args.modifiers : undefined;
-
-      await this.tabGroups.movePhantomCursor(tabId, target.x, target.y, true, "Clicking");
-      await armTabBackgroundClickGuard(tabId);
-      await this.cdp.dispatchClick(tabId, target.x, target.y, {
-        button,
-        clickCount,
-        modifiers
-      });
-      await sleepMs(80);
-      const interceptedPopupUrls = await drainTabBackgroundClickGuard(tabId);
-      let popupNotice = "";
-      if (interceptedPopupUrls.length > 0) {
-        const openedTabIds = await this.tabGroups.createBackgroundPopupTabs(
-          tabId,
-          interceptedPopupUrls
-        );
-        if (openedTabIds.length > 0) {
-          popupNotice = ` Opened background tab(s) [${openedTabIds.join(", ")}] in MCP tab group without stealing focus.`;
+    return this.cdp.withAttachedTab(tabId, async () => {
+      if (action === "screenshot" || action === "zoom") {
+        const scale = asNumber(args.scale);
+        const region = action === "zoom" ? asRegionQuad(args.region) : undefined;
+        if (action === "zoom" && !region) {
+          return textResult(
+            "Parameter `region` ([x0, y0, x1, y1]) is required for `zoom`.",
+            true
+          );
         }
+
+        await this.tabGroups.hideIndicatorForScreenshot(tabId);
+        await sleepMs(35);
+        let shot;
+        try {
+          shot = await this.cdp.captureScreenshot(tabId, { region, scale });
+        } finally {
+          await this.tabGroups.restoreIndicatorAfterScreenshot(tabId);
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Captured ${action} (imageId: ${shot.imageId}, coordinate_frame: ${shot.frame.screenshotWidth}x${shot.frame.screenshotHeight}, viewport: ${shot.frame.viewportWidth}x${shot.frame.viewportHeight}).`
+            },
+            {
+              type: "image",
+              data: shot.base64,
+              mimeType: shot.mimeType
+            }
+          ]
+        };
       }
 
-      await this.maybeRecordGifFrame(tabId, tab.groupId, {
-        type: action,
-        description: `Click (${target.x}, ${target.y})`,
-        coordinate: [target.x, target.y]
-      });
+      await this.tabGroups.showActiveVisualIndicator(tabId);
 
-      return textResult(
-        `Performed ${action} at viewport (${target.x}, ${target.y}).${popupNotice}`
-      );
-    }
-
-    if (action === "hover") {
-      const target = await this.resolveActionTargetPoint(tabId, args);
-      if ("error" in target) {
-        return textResult(target.error, true);
-      }
-      await this.tabGroups.movePhantomCursor(tabId, target.x, target.y, false, "Hovering");
-      await this.cdp.dispatchHover(tabId, target.x, target.y);
-      return textResult(`Moved cursor to viewport (${target.x}, ${target.y}).`);
-    }
-
-    if (action === "left_click_drag") {
-      const rawStart = asCoordinatePair(args.start_coordinate);
-      const rawEnd = asCoordinatePair(args.coordinate);
-      if (!rawStart || !rawEnd) {
-        return textResult(
-          "Parameters `start_coordinate` and `coordinate` are required for `left_click_drag`.",
-          true
-        );
-      }
-      const startPt = this.cdp.toViewportPoint(tabId, rawStart);
-      const endPt = this.cdp.toViewportPoint(tabId, rawEnd);
-      const modifiers = typeof args.modifiers === "string" ? args.modifiers : undefined;
-      await this.tabGroups.movePhantomCursor(tabId, startPt.x, startPt.y, true, "Dragging");
-      await this.cdp.dispatchDrag(tabId, startPt.x, startPt.y, endPt.x, endPt.y, modifiers);
-      await this.tabGroups.movePhantomCursor(tabId, endPt.x, endPt.y, false, "Dragged");
-      await this.maybeRecordGifFrame(tabId, tab.groupId, {
-        type: "left_click_drag",
-        description: "Drag",
-        start_coordinate: [startPt.x, startPt.y],
-        coordinate: [endPt.x, endPt.y]
-      });
-      return textResult(
-        `Dragged from (${startPt.x}, ${startPt.y}) to (${endPt.x}, ${endPt.y}).`
-      );
-    }
-
-    if (action === "scroll") {
-      const direction = args.scroll_direction;
       if (
-        direction !== "up" &&
-        direction !== "down" &&
-        direction !== "left" &&
-        direction !== "right"
+        action === "left_click" ||
+        action === "right_click" ||
+        action === "double_click" ||
+        action === "triple_click"
       ) {
+        const target = await this.resolveActionTargetPoint(tabId, args);
+        if ("error" in target) {
+          return textResult(target.error, true);
+        }
+
+        const button = action === "right_click" ? "right" : "left";
+        const clickCount =
+          action === "triple_click" ? 3 : action === "double_click" ? 2 : 1;
+        const modifiers = typeof args.modifiers === "string" ? args.modifiers : undefined;
+
+        await this.tabGroups.movePhantomCursor(tabId, target.x, target.y, true, "Clicking");
+        await armTabBackgroundClickGuard(tabId);
+        await this.cdp.dispatchClick(tabId, target.x, target.y, {
+          button,
+          clickCount,
+          modifiers
+        });
+        await sleepMs(80);
+        const interceptedPopupUrls = await drainTabBackgroundClickGuard(tabId);
+        let popupNotice = "";
+        if (interceptedPopupUrls.length > 0) {
+          const openedTabIds = await this.tabGroups.createBackgroundPopupTabs(
+            tabId,
+            interceptedPopupUrls
+          );
+          if (openedTabIds.length > 0) {
+            popupNotice = ` Opened background tab(s) [${openedTabIds.join(", ")}] in MCP tab group without stealing focus.`;
+          }
+        }
+
+        await this.maybeRecordGifFrame(tabId, tab.groupId, {
+          type: action,
+          description: `Click (${target.x}, ${target.y})`,
+          coordinate: [target.x, target.y]
+        });
+
         return textResult(
-          'Parameter `scroll_direction` ("up" | "down" | "left" | "right") is required for `scroll`.',
-          true
+          `Performed ${action} at viewport (${target.x}, ${target.y}).${popupNotice}`
         );
       }
-      const rawCoord = asCoordinatePair(args.coordinate) ?? [640, 360];
-      const pt = this.cdp.toViewportPoint(tabId, rawCoord);
-      const ticks = asNumber(args.scroll_amount) ?? 3;
-      await this.tabGroups.movePhantomCursor(tabId, pt.x, pt.y, false, `Scrolling ${direction}`);
-      await this.cdp.dispatchScroll(tabId, pt.x, pt.y, direction, ticks);
-      await this.maybeRecordGifFrame(tabId, tab.groupId, {
-        type: "scroll",
-        description: `Scroll ${direction}`,
-        coordinate: [pt.x, pt.y]
-      });
-      return textResult(`Scrolled ${direction} (${ticks} ticks) at (${pt.x}, ${pt.y}).`);
-    }
 
-    if (action === "type") {
-      const text = typeof args.text === "string" ? args.text : "";
-      if (!text) {
-        return textResult("Parameter `text` is required for `type`.", true);
+      if (action === "hover") {
+        const target = await this.resolveActionTargetPoint(tabId, args);
+        if ("error" in target) {
+          return textResult(target.error, true);
+        }
+        await this.tabGroups.movePhantomCursor(tabId, target.x, target.y, false, "Hovering");
+        await this.cdp.dispatchHover(tabId, target.x, target.y);
+        return textResult(`Moved cursor to viewport (${target.x}, ${target.y}).`);
       }
-      await this.cdp.dispatchTypeText(tabId, text);
-      await this.maybeRecordGifFrame(tabId, tab.groupId, {
-        type: "type",
-        description: `Type "${text.slice(0, 24)}"`
-      });
-      return textResult(`Typed ${text.length} character(s).`);
-    }
 
-    if (action === "key") {
+      if (action === "left_click_drag") {
+        const rawStart = asCoordinatePair(args.start_coordinate);
+        const rawEnd = asCoordinatePair(args.coordinate);
+        if (!rawStart || !rawEnd) {
+          return textResult(
+            "Parameters `start_coordinate` and `coordinate` are required for `left_click_drag`.",
+            true
+          );
+        }
+        const startPt = this.cdp.toViewportPoint(tabId, rawStart);
+        const endPt = this.cdp.toViewportPoint(tabId, rawEnd);
+        const modifiers = typeof args.modifiers === "string" ? args.modifiers : undefined;
+        await this.tabGroups.movePhantomCursor(tabId, startPt.x, startPt.y, true, "Dragging");
+        await this.cdp.dispatchDrag(tabId, startPt.x, startPt.y, endPt.x, endPt.y, modifiers);
+        await this.tabGroups.movePhantomCursor(tabId, endPt.x, endPt.y, false, "Dragged");
+        await this.maybeRecordGifFrame(tabId, tab.groupId, {
+          type: "left_click_drag",
+          description: "Drag",
+          start_coordinate: [startPt.x, startPt.y],
+          coordinate: [endPt.x, endPt.y]
+        });
+        return textResult(
+          `Dragged from (${startPt.x}, ${startPt.y}) to (${endPt.x}, ${endPt.y}).`
+        );
+      }
+
+      if (action === "scroll") {
+        const direction = args.scroll_direction;
+        if (
+          direction !== "up" &&
+          direction !== "down" &&
+          direction !== "left" &&
+          direction !== "right"
+        ) {
+          return textResult(
+            'Parameter `scroll_direction` ("up" | "down" | "left" | "right") is required for `scroll`.',
+            true
+          );
+        }
+        const rawCoord = asCoordinatePair(args.coordinate) ?? [640, 360];
+        const pt = this.cdp.toViewportPoint(tabId, rawCoord);
+        const ticks = asNumber(args.scroll_amount) ?? 3;
+        await this.tabGroups.movePhantomCursor(tabId, pt.x, pt.y, false, `Scrolling ${direction}`);
+        await this.cdp.dispatchScroll(tabId, pt.x, pt.y, direction, ticks);
+        await this.maybeRecordGifFrame(tabId, tab.groupId, {
+          type: "scroll",
+          description: `Scroll ${direction}`,
+          coordinate: [pt.x, pt.y]
+        });
+        return textResult(`Scrolled ${direction} (${ticks} ticks) at (${pt.x}, ${pt.y}).`);
+      }
+
+      if (action === "type") {
+        const text = typeof args.text === "string" ? args.text : "";
+        if (!text) {
+          return textResult("Parameter `text` is required for `type`.", true);
+        }
+        await this.cdp.dispatchTypeText(tabId, text);
+        await this.maybeRecordGifFrame(tabId, tab.groupId, {
+          type: "type",
+          description: `Type "${text.slice(0, 24)}"`
+        });
+        return textResult(`Typed ${text.length} character(s).`);
+      }
+
       const keyText = typeof args.text === "string" ? args.text.trim() : "";
       if (!keyText) {
         return textResult("Parameter `text` is required for `key`.", true);
@@ -609,9 +631,7 @@ export class ToolExecutor {
         description: `Press ${keyText}`
       });
       return textResult(`Pressed key sequence "${keyText}" (repeat=${repeat}).`);
-    }
-
-    return textResult(`Unsupported computer action: "${action}".`, true);
+    });
   }
 
   private async handleJavaScriptTool(
@@ -680,9 +700,7 @@ export class ToolExecutor {
     if (tabId === undefined) {
       return textResult("Parameter `tabId` is required.", true);
     }
-    await this.tabGroups.assertTabInSession(tabId, scope);
-    await this.cdp.ensureAttached(tabId).catch(() => undefined);
-
+    const tab = await this.tabGroups.assertTabInSession(tabId, scope);
     const logs = this.cdp.readConsoleMessages(tabId, {
       onlyErrors: Boolean(args.onlyErrors),
       pattern: typeof args.pattern === "string" ? args.pattern : undefined,
@@ -691,6 +709,9 @@ export class ToolExecutor {
     });
 
     if (logs.length === 0) {
+      if (!isRestrictedBrowserUrl(tab.url)) {
+        await this.cdp.ensureAttached(tabId).catch(() => undefined);
+      }
       return textResult("No matching console messages recorded for this tab.");
     }
     const formatted = logs
@@ -707,9 +728,7 @@ export class ToolExecutor {
     if (tabId === undefined) {
       return textResult("Parameter `tabId` is required.", true);
     }
-    await this.tabGroups.assertTabInSession(tabId, scope);
-    await this.cdp.ensureAttached(tabId).catch(() => undefined);
-
+    const tab = await this.tabGroups.assertTabInSession(tabId, scope);
     const reqs = this.cdp.readNetworkRequests(tabId, {
       urlPattern: typeof args.urlPattern === "string" ? args.urlPattern : undefined,
       clear: Boolean(args.clear),
@@ -717,6 +736,9 @@ export class ToolExecutor {
     });
 
     if (reqs.length === 0) {
+      if (!isRestrictedBrowserUrl(tab.url)) {
+        await this.cdp.ensureAttached(tabId).catch(() => undefined);
+      }
       return textResult("No matching network requests recorded for this tab.");
     }
     const formatted = reqs

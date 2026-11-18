@@ -1,6 +1,6 @@
 # Antigravity Browser Control (`agy-web-extension`)
 
-Non-intrusive Chrome browser automation for **Antigravity (`agy`)**, modeled 1:1 on Anthropic's *Claude in Chrome* extension architecture (statically analyzed via REA).
+Non-intrusive Chrome browser automation for **Antigravity (`agy`)** via isolated background Tab Groups and on-demand Chrome DevTools Protocol (CDP) control.
 
 ## Key Highlights
 
@@ -18,7 +18,7 @@ Non-intrusive Chrome browser automation for **Antigravity (`agy`)**, modeled 1:1
 ├── AGENTS.md                        # Coding rules & non-intrusive browser invariants
 ├── README.md                        # Project overview & quickstart
 ├── docs/
-│   ├── architecture.md              # REA reverse-engineering findings & CDP/Bridge design
+│   ├── architecture.md              # Background Tab Group, lazy CDP & Bridge Hub architecture
 │   └── skill-installation.md        # Step-by-step global MCP + Skill setup for agy
 ├── skills/
 │   └── agy-web-browser/SKILL.md     # Antigravity skill for browser automation

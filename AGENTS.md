@@ -2,7 +2,7 @@
 
 ## Project Purpose
 
-`agy-web-extension` provides non-intrusive Chrome browser automation for **Antigravity (`agy`)**, modeled 1:1 on Anthropic's *Claude in Chrome* extension architecture (reverse-engineered via REA).
+`agy-web-extension` provides non-intrusive Chrome browser automation for **Antigravity (`agy`)** via isolated background Chrome Tab Groups and lazy Chrome DevTools Protocol (CDP) control.
 
 It consists of three parts:
 1. **Chrome Manifest V3 Extension** (`src/extension/` -> `dist/extension/`): Manages isolated Chrome Tab Groups (`active: false`), attaches `chrome.debugger` (CDP 1.3) with `Emulation.setFocusEmulationEnabled({ enabled: true })` and background tab mute protection, renders the orange pulsing glow border + curved phantom cursor + in-page Stop button, and executes all 16 browser tools with zero domain permission prompts.

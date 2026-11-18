@@ -60,7 +60,7 @@ async function handleInboundMessage(msg: ExtensionInboundMessage): Promise<void>
   if (msg.type === "peer_disconnected") {
     const tabIds = await tabGroups.cleanupSession(msg.sessionId);
     for (const tabId of tabIds) {
-      await cdp.detachTab(tabId).catch(() => undefined);
+      await cdp.disposeTab(tabId).catch(() => undefined);
     }
     return;
   }
@@ -161,6 +161,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       void connectBridge();
     }
   }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void cdp.disposeTab(tabId).catch(() => undefined);
 });
 
 chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {

@@ -1,8 +1,6 @@
-# Architecture & REA Analysis
+# System Architecture
 
-## 1. REA Reverse-Engineering Summary
-
-The reference package (`claude-extension`, Manifest V3 v1.0.107, ID `fcoeoabgfenejglbffodgkkbkcdhcgfn`) was analyzed statically with **REA** (`analyze_javascript_application`, retained parent Evidence ID `ev_5500ee9e018190e8f8ed511a0c55b9075760bde9cf8d3ac59dc68caef6257236`, 12 core bundles, 309,281 AST nodes, 1,172 static findings).
+## 1. Non-Intrusive Background Tab Automation
 
 ### Why Background Tab Automation Does Not Disturb the User
 
@@ -11,10 +9,12 @@ The reference package (`claude-extension`, Manifest V3 v1.0.107, ID `fcoeoabgfen
    - Because `active` is `false` and `chrome.windows.update({ focused: true })` is never called, the user's active tab, scroll position, tab index, and OS focus remain untouched.
    - A capture-phase click guard (`__agyBgClickGuard`) intercepts `<a target="_blank">` navigations triggered by agent clicks and opens them with `active: false` inside the same Tab Group so popups cannot steal foreground focus.
 
-2. **CDP Input + `Emulation.setFocusEmulationEnabled`**:
+2. **Lazy CDP Input + `Emulation.setFocusEmulationEnabled` + Idle Auto-Detach**:
+   - Pure DOM/tab tools (`navigate`, `read_page`, `find`, `form_input`, `get_page_text`, `file_upload`, `upload_image`, `scroll_to`) execute entirely via `chrome.tabs` and `chrome.scripting` without attaching `chrome.debugger` — so Chrome's debugging infobar never appears during standard browsing, reading, or form-filling workflows.
    - Background tabs normally report `document.hasFocus() === false`, causing SPAs, dropdown menus, rich-text editors, and focus-dependent widgets to ignore synthetic events.
-   - `CdpController` attaches `chrome.debugger` (`1.3`) to the target `tabId` and sends `Emulation.setFocusEmulationEnabled({ enabled: true })`. Blink treats the background tab as focused without bringing the tab or window to the front.
+   - When a CDP-backed tool runs (`computer` input/screenshots, `javascript_tool`, `navigate` with `force: true`), `CdpController` attaches `chrome.debugger` (`1.3`) to the target `tabId` on demand and sends `Emulation.setFocusEmulationEnabled({ enabled: true })`. Blink treats the background tab as focused without bringing the tab or window to the front.
    - Before enabling focus emulation on an inactive non-audible tab, `CdpController` mutes the tab (`chrome.tabs.update(tabId, { muted: true })`) so background media autoplay triggered by focus never surprises the user, and lifts the mute on detach.
+   - After **5 seconds of idle time** with no active CDP operations on a tab, `CdpController` automatically disables focus emulation, lifts extension-applied mute, and detaches `chrome.debugger` so Chrome's debugging banner disappears immediately across all profiles while retaining buffered console and network logs in memory.
    - Mouse clicks, drags, hovers, scroll wheels, text insertion, and key chords are dispatched directly to the tab's renderer via `Input.dispatchMouseEvent`, `Input.insertText`, and `Input.dispatchKeyEvent` — leaving the OS mouse cursor untouched.
    - Screenshots (`Page.captureScreenshot`) capture directly from the tab's compositor surface (`fromSurface: true`) even while the tab is in the background.
 

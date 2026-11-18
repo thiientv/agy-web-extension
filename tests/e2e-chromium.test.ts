@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server as HttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { BridgeHubServer } from "../src/bridge/hub-server.js";
 
 const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 const extPath = join(rootDir, "dist/extension");
@@ -36,6 +37,8 @@ function extractFirstText(content: unknown): string {
 }
 
 describe("Real Chrome for Testing E2E: Extension + Bridge + MCP Server", () => {
+  let bridgeHub: BridgeHubServer | null = null;
+  let bridgePort = 0;
   let webServer: HttpServer | null = null;
   let webPort = 0;
   let chromeProc: ChildProcess | null = null;
@@ -45,12 +48,26 @@ describe("Real Chrome for Testing E2E: Extension + Bridge + MCP Server", () => {
   let sampleUploadPath = "";
 
   let fgHiddenEvents = 0;
+  let attachedTabIdsLatest: number[] = [];
 
   beforeAll(async () => {
     webServer = createServer((req, res) => {
       const reqUrl = req.url ?? "/";
       if (reqUrl.startsWith("/fg-hidden")) {
         fgHiddenEvents += 1;
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      if (reqUrl.startsWith("/debugger-probe")) {
+        const parsed = new URL(reqUrl, "http://127.0.0.1");
+        const raw = parsed.searchParams.get("tabs") ?? "";
+        attachedTabIdsLatest = raw
+          ? raw
+              .split(",")
+              .map((s) => Number(s))
+              .filter((n) => Number.isFinite(n))
+          : [];
         res.writeHead(204);
         res.end();
         return;
@@ -120,12 +137,33 @@ describe("Real Chrome for Testing E2E: Extension + Bridge + MCP Server", () => {
     sampleUploadPath = join(userDataDir, "hello-agy.txt");
     writeFileSync(sampleUploadPath, "Antigravity upload payload!", "utf8");
 
+    bridgeHub = new BridgeHubServer({ port: 0 });
+    bridgePort = await bridgeHub.start();
+
+    const isolatedExtPath = join(userDataDir, "extension");
+    cpSync(extPath, isolatedExtPath, { recursive: true });
+    const manifestPath = join(isolatedExtPath, "manifest.json");
+    const manifestSource = readFileSync(manifestPath, "utf8");
+    writeFileSync(
+      manifestPath,
+      manifestSource.replace("ws://127.0.0.1:*", "ws://127.0.0.1:* http://127.0.0.1:*"),
+      "utf8"
+    );
+    const bgPath = join(isolatedExtPath, "background.js");
+    const bgSource = readFileSync(bgPath, "utf8");
+    const debuggerProbeSnippet = `\nsetInterval(() => {\n  chrome.debugger.getTargets((targets) => {\n    const ids = targets.filter((t) => t.attached && typeof t.tabId === "number").map((t) => t.tabId).join(",");\n    fetch("http://127.0.0.1:${webPort}/debugger-probe?tabs=" + ids).catch(() => {});\n  });\n}, 200);\n`;
+    writeFileSync(
+      bgPath,
+      debuggerProbeSnippet + bgSource.replace(/18765/g, String(bridgePort)),
+      "utf8"
+    );
+
     transport = new StdioClientTransport({
       command: process.execPath,
       args: [mcpServerPath],
       env: {
         ...(process.env as Record<string, string>),
-        AGY_BRIDGE_PORT: "18765"
+        AGY_BRIDGE_PORT: String(bridgePort)
       }
     });
     mcpClient = new Client(
@@ -138,8 +176,8 @@ describe("Real Chrome for Testing E2E: Extension + Bridge + MCP Server", () => {
       cftBinary,
       [
         `--user-data-dir=${userDataDir}`,
-        `--disable-extensions-except=${extPath}`,
-        `--load-extension=${extPath}`,
+        `--disable-extensions-except=${isolatedExtPath}`,
+        `--load-extension=${isolatedExtPath}`,
         "--no-first-run",
         "--no-default-browser-check",
         "--window-size=1280,800",
@@ -151,7 +189,7 @@ describe("Real Chrome for Testing E2E: Extension + Bridge + MCP Server", () => {
     let connected = false;
     for (let i = 0; i < 40; i += 1) {
       await new Promise((r) => setTimeout(r, 250));
-      const res = await fetch("http://127.0.0.1:18765/health").catch(() => null);
+      const res = await fetch(`http://127.0.0.1:${bridgePort}/health`).catch(() => null);
       if (res && res.ok) {
         const body = (await res.json()) as { extensionConnected?: boolean };
         if (body.extensionConnected) {
@@ -170,7 +208,11 @@ describe("Real Chrome for Testing E2E: Extension + Bridge + MCP Server", () => {
     if (chromeProc) {
       chromeProc.kill("SIGTERM");
     }
+    if (bridgeHub) {
+      await bridgeHub.stop();
+    }
     if (webServer) {
+      webServer.closeAllConnections();
       await new Promise<void>((resolve) => webServer!.close(() => resolve()));
     }
     if (userDataDir) {
@@ -202,21 +244,6 @@ describe("Real Chrome for Testing E2E: Extension + Bridge + MCP Server", () => {
     });
     expect(extractFirstText(navRes.content)).toContain("Antigravity Test Playground");
 
-    const focusCheckRes = await mcpClient!.callTool({
-      name: "javascript_tool",
-      arguments: {
-        tabId,
-        action: "javascript_exec",
-        text: "({ hasFocus: document.hasFocus(), hidden: document.hidden })"
-      }
-    });
-    const focusInfo = JSON.parse(extractFirstText(focusCheckRes.content)) as {
-      hasFocus: boolean;
-      hidden: boolean;
-    };
-    expect(focusInfo.hasFocus).toBe(true);
-    expect(fgHiddenEvents).toBe(0);
-
     const readRes = await mcpClient!.callTool({
       name: "read_page",
       arguments: { tabId, filter: "interactive" }
@@ -238,6 +265,24 @@ describe("Real Chrome for Testing E2E: Extension + Bridge + MCP Server", () => {
       arguments: { tabId, ref: searchRef, value: "Alphonso Mango" }
     });
     expect(extractFirstText(formRes.content)).toContain("Updated input");
+
+    await new Promise((r) => setTimeout(r, 250));
+    expect(attachedTabIdsLatest).toEqual([]);
+
+    const focusCheckRes = await mcpClient!.callTool({
+      name: "javascript_tool",
+      arguments: {
+        tabId,
+        action: "javascript_exec",
+        text: "({ hasFocus: document.hasFocus(), hidden: document.hidden })"
+      }
+    });
+    const focusInfo = JSON.parse(extractFirstText(focusCheckRes.content)) as {
+      hasFocus: boolean;
+      hidden: boolean;
+    };
+    expect(focusInfo.hasFocus).toBe(true);
+    expect(fgHiddenEvents).toBe(0);
 
     const findBtnRes = await mcpClient!.callTool({
       name: "find",
@@ -348,6 +393,17 @@ describe("Real Chrome for Testing E2E: Extension + Bridge + MCP Server", () => {
       arguments: { tabId: secondTabId }
     });
     expect(extractFirstText(closeRes.content)).toContain(`Closed tab ${secondTabId}`);
+
+    await new Promise((r) => setTimeout(r, 350));
+    expect(attachedTabIdsLatest).toContain(tabId);
+
+    for (let i = 0; i < 30; i += 1) {
+      await new Promise((r) => setTimeout(r, 250));
+      if (!attachedTabIdsLatest.includes(tabId)) {
+        break;
+      }
+    }
+    expect(attachedTabIdsLatest).toEqual([]);
     expect(fgHiddenEvents).toBe(0);
   });
 });
