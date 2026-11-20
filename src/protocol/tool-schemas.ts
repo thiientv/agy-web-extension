@@ -504,5 +504,31 @@ export const BROWSER_TOOL_SCHEMAS: ReadonlyArray<ToolDefinitionSchema> = [
       },
       required: ["action", "tabId"]
     }
+  },
+  {
+    name: "tabs_mute",
+    description:
+      "Mute or unmute individual Chrome tabs or entire websites/domains in the active Chrome profile. Site mute rules persist per Chrome profile and automatically mute matching tabs whenever they open or navigate, bypassing Chrome's restricted chrome://settings pages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["mute_tab", "unmute_tab", "mute_site", "unmute_site", "list"],
+          description:
+            'Action to perform: "mute_tab" / "unmute_tab" for a specific tabId, "mute_site" / "unmute_site" for a domain or URL (matches subdomains too, e.g. "youtube.com" mutes www.youtube.com), or "list" to inspect muted sites and tabs.'
+        },
+        tabId: {
+          type: "integer",
+          description: 'Target tab ID (required for "mute_tab" and "unmute_tab").'
+        },
+        site: {
+          type: "string",
+          description:
+            'Domain or URL to mute/unmute (required for "mute_site" and "unmute_site", e.g. "youtube.com" or "https://www.youtube.com").'
+        }
+      },
+      required: ["action"]
+    }
   }
 ];

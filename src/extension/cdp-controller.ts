@@ -500,6 +500,10 @@ export class CdpController {
     await this.detachTab(tabId);
   }
 
+  public clearAutoMute(tabId: number): void {
+    this.mutedByUs.delete(tabId);
+  }
+
   public getOpenDialog(tabId: number): { type: string; message: string } | undefined {
     return this.openDialogs.get(tabId);
   }

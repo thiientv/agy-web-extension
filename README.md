@@ -58,7 +58,7 @@ See [docs/skill-installation.md](./docs/skill-installation.md) for manual instal
 
 ---
 
-## Supported MCP Tools (16 Tools)
+## Supported MCP Tools (17 Tools)
 
 | Tool | Description |
 | :--- | :--- |
@@ -78,6 +78,7 @@ See [docs/skill-installation.md](./docs/skill-installation.md) for manual instal
 | `read_network_requests` | Inspect captured HTTP/XHR/Fetch requests with automatic auth query redaction |
 | `resize_window` | Resize browser window dimensions |
 | `gif_creator` | Record action frames and export annotated animated GIFs via Offscreen Canvas |
+| `tabs_mute` | Mute/unmute individual tabs or persistent site/domain rules per Chrome profile |
 
 ---
 

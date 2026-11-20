@@ -14,6 +14,7 @@ import {
   resolveElementViewportCenter,
   type UploadFilePayload
 } from "./page-scripts.js";
+import { SiteMuteManager } from "./site-mute-manager.js";
 import type { TabGroupManager } from "./tab-group-manager.js";
 
 interface GifRecordedFrame {
@@ -141,11 +142,17 @@ async function ensureOffscreenDocumentReady(): Promise<void> {
 export class ToolExecutor {
   private readonly tabGroups: TabGroupManager;
   private readonly cdp: CdpController;
+  private readonly siteMutes: SiteMuteManager;
   private readonly gifByGroup = new Map<number, GifSessionState>();
 
-  constructor(tabGroups: TabGroupManager, cdp: CdpController) {
+  constructor(tabGroups: TabGroupManager, cdp: CdpController, siteMutes?: SiteMuteManager) {
     this.tabGroups = tabGroups;
     this.cdp = cdp;
+    this.siteMutes =
+      siteMutes ??
+      new SiteMuteManager(undefined, (tabId) => {
+        this.cdp.clearAutoMute(tabId);
+      });
   }
 
   private async maybeRecordGifFrame(
@@ -983,6 +990,68 @@ export class ToolExecutor {
     return textResult(`Unsupported gif_creator action: "${action}".`, true);
   }
 
+  private async handleTabsMute(args: Record<string, unknown>): Promise<McpToolCallResult> {
+    const action = typeof args.action === "string" ? args.action.trim() : "";
+    if (!action) {
+      return textResult("Parameter `action` is required.", true);
+    }
+
+    if (action === "mute_tab" || action === "unmute_tab") {
+      const tabId = asNumber(args.tabId);
+      if (tabId === undefined) {
+        return textResult(`Parameter \`tabId\` is required for "${action}".`, true);
+      }
+      const muted = action === "mute_tab";
+      const updated = await this.siteMutes.setTabMuted(tabId, muted);
+      return textResult(
+        `${muted ? "Muted" : "Unmuted"} tab ${updated.id} (${updated.url || "about:blank"}).`
+      );
+    }
+
+    if (action === "mute_site") {
+      const site = typeof args.site === "string" ? args.site.trim() : "";
+      if (!site) {
+        return textResult('Parameter `site` is required for "mute_site".', true);
+      }
+      const res = await this.siteMutes.muteSite(site);
+      return textResult(
+        `Muted site rule "${res.rule}" for this Chrome profile. Updated ${res.updatedTabIds.length} open tab(s)${
+          res.updatedTabIds.length > 0 ? `: [${res.updatedTabIds.join(", ")}]` : ""
+        }. New tabs matching "${res.rule}" will be muted automatically.`
+      );
+    }
+
+    if (action === "unmute_site") {
+      const site = typeof args.site === "string" ? args.site.trim() : "";
+      if (!site) {
+        return textResult('Parameter `site` is required for "unmute_site".', true);
+      }
+      const res = await this.siteMutes.unmuteSite(site);
+      return textResult(
+        `Unmuted site rule "${res.rule}" (${res.removed ? "removed from persistent rules" : "was not in persistent rules"}). Unmuted ${res.updatedTabIds.length} open tab(s)${
+          res.updatedTabIds.length > 0 ? `: [${res.updatedTabIds.join(", ")}]` : ""
+        }.`
+      );
+    }
+
+    if (action === "list") {
+      const state = await this.siteMutes.listState();
+      const siteLines =
+        state.mutedSites.length === 0 ? "none" : state.mutedSites.map((s) => `- ${s}`).join("\n");
+      const tabLines =
+        state.mutedTabs.length === 0
+          ? "none"
+          : state.mutedTabs
+              .map((t) => `- tabId=${t.id} | title=${JSON.stringify(t.title)} | url=${t.url}`)
+              .join("\n");
+      return textResult(
+        `Muted Sites (${state.mutedSites.length}):\n${siteLines}\n\nMuted Tabs (${state.mutedTabs.length}):\n${tabLines}`
+      );
+    }
+
+    return textResult(`Unsupported tabs_mute action: "${action}".`, true);
+  }
+
   public async executeTool(
     toolName: string,
     args: Record<string, unknown>,
@@ -1042,6 +1111,8 @@ export class ToolExecutor {
           return await this.handleFileUpload(args, scope);
         case "gif_creator":
           return await this.handleGifCreator(args, scope);
+        case "tabs_mute":
+          return await this.handleTabsMute(args);
         default:
           return textResult(`Unknown browser tool: "${toolName}".`, true);
       }

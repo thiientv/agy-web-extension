@@ -58,6 +58,7 @@ In Antigravity (`agy`), `agy-browser` tools are lazy-loaded. Invoke them via `ca
 | `read_network_requests` | Read captured XHR/Fetch/HTTP requests (auth params redacted) | `tabId: number`, `urlPattern?: string`, `clear?: boolean` |
 | `resize_window` | Resize browser window for responsive testing | `tabId: number`, `width: number`, `height: number` |
 | `gif_creator` | Record & export annotated GIF of actions in Tab Group | `tabId: number`, `action: "start_recording" \| "stop_recording" \| "export" \| "clear"`, `download?: boolean` |
+| `tabs_mute` | Mute/unmute tabs or persistent site/domain rules per Chrome profile | `action: "mute_tab" \| "unmute_tab" \| "mute_site" \| "unmute_site" \| "list"`, `tabId?: number`, `site?: string` |
 
 ## Common Mistakes to Avoid
 

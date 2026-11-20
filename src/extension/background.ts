@@ -5,6 +5,7 @@ import {
   type ExtensionOutboundMessage
 } from "../protocol/messages.js";
 import { CdpController } from "./cdp-controller.js";
+import { SiteMuteManager } from "./site-mute-manager.js";
 import { TabGroupManager } from "./tab-group-manager.js";
 import { ToolExecutor } from "./tool-executor.js";
 
@@ -19,7 +20,10 @@ interface ProfileIdentity {
 
 const tabGroups = new TabGroupManager();
 const cdp = new CdpController();
-const executor = new ToolExecutor(tabGroups, cdp);
+const siteMutes = new SiteMuteManager(undefined, (tabId) => {
+  cdp.clearAutoMute(tabId);
+});
+const executor = new ToolExecutor(tabGroups, cdp, siteMutes);
 
 let bridgeSocket: WebSocket | null = null;
 let connecting = false;
@@ -259,6 +263,20 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
   }
 });
 
+chrome.tabs.onCreated.addListener((tab) => {
+  const url = tab.url ?? tab.pendingUrl;
+  if (tab.id !== undefined && url) {
+    void siteMutes.syncTabMuteState(tab.id, url);
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const url = changeInfo.url ?? (changeInfo.status === "loading" ? tab.url : undefined);
+  if (url) {
+    void siteMutes.syncTabMuteState(tabId, url);
+  }
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   void cdp.disposeTab(tabId).catch(() => undefined);
 });
@@ -349,4 +367,5 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
 });
 
 void ensureKeepaliveOffscreen();
+void siteMutes.warmup();
 void connectBridge();
