@@ -35,6 +35,28 @@ interface GifSessionState {
   frames: GifRecordedFrame[];
 }
 
+function formatProfileContextBlock(scope: SessionScope): string {
+  const lines: string[] = [];
+  if (scope.activeProfile) {
+    const emailPart = scope.activeProfile.profileEmail
+      ? `, email=${scope.activeProfile.profileEmail}`
+      : "";
+    lines.push(
+      `Active Profile: ${scope.activeProfile.profileName} (id=${scope.activeProfile.profileId}${emailPart})`
+    );
+  }
+  if (scope.connectedProfiles && scope.connectedProfiles.length > 0) {
+    lines.push(`Connected Profiles (${scope.connectedProfiles.length}):`);
+    for (const prof of scope.connectedProfiles) {
+      const emailPart = prof.profileEmail ? `, email=${prof.profileEmail}` : "";
+      const activeTag =
+        scope.activeProfile && prof.profileId === scope.activeProfile.profileId ? " [active]" : "";
+      lines.push(`- ${prof.profileName} (id=${prof.profileId}${emailPart})${activeTag}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 function textResult(text: string, isError = false): McpToolCallResult {
   return {
     ...(isError ? { isError: true } : {}),
@@ -179,16 +201,18 @@ export class ToolExecutor {
   ): Promise<McpToolCallResult> {
     const createIfEmpty = Boolean(args.createIfEmpty);
     const ctx = await this.tabGroups.getOrCreateSessionContext(scope, createIfEmpty);
+    const profileBlock = formatProfileContextBlock(scope);
+    const profilePrefix = profileBlock ? `${profileBlock}\n` : "";
     if (!ctx) {
       return textResult(
-        "No MCP tab group exists for this session yet. Call tabs_context_mcp with createIfEmpty: true to create an isolated background tab group."
+        `${profilePrefix}No MCP tab group exists for this session yet. Call tabs_context_mcp with createIfEmpty: true to create an isolated background tab group.`
       );
     }
     const lines = ctx.availableTabs.map(
       (t) => `- tabId=${t.id} | title=${JSON.stringify(t.title || "Untitled")} | url=${t.url}`
     );
     return textResult(
-      `MCP Tab Group ID: ${ctx.tabGroupId}\nCurrent Tab ID: ${ctx.currentTabId}\nAvailable Tabs (${ctx.availableTabs.length}):\n${lines.join("\n")}`
+      `${profilePrefix}MCP Tab Group ID: ${ctx.tabGroupId}\nCurrent Tab ID: ${ctx.currentTabId}\nAvailable Tabs (${ctx.availableTabs.length}):\n${lines.join("\n")}`
     );
   }
 

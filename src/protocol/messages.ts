@@ -1,10 +1,22 @@
 export const DEFAULT_BRIDGE_HOST = "127.0.0.1";
 export const DEFAULT_BRIDGE_PORT = 18765;
 
+export interface ConnectedProfileSummary {
+  profileId: string;
+  profileName: string;
+  profileEmail?: string;
+  browserName: string;
+  extensionVersion: string;
+  connectedAt: number;
+  lastFocusedAt: number;
+}
+
 export interface SessionScope {
   sessionId: string;
   displayName: string;
   tabGroupId?: number;
+  activeProfile?: ConnectedProfileSummary;
+  connectedProfiles?: ConnectedProfileSummary[];
 }
 
 export type McpContentBlock =
@@ -27,6 +39,18 @@ export interface ExtensionHelloMessage {
   type: "extension_hello";
   extensionVersion: string;
   browserName: string;
+  profileId?: string;
+  profileName?: string;
+  profileEmail?: string;
+  lastFocusedAt?: number;
+}
+
+export interface ExtensionProfileUpdateMessage {
+  type: "extension_profile_update";
+  profileId: string;
+  profileName?: string;
+  profileEmail?: string;
+  lastFocusedAt?: number;
 }
 
 export interface ExtensionToolResultMessage {
@@ -45,6 +69,7 @@ export interface PongMessage {
 
 export type ExtensionOutboundMessage =
   | ExtensionHelloMessage
+  | ExtensionProfileUpdateMessage
   | ExtensionToolResultMessage
   | PingMessage
   | PongMessage;
@@ -81,6 +106,7 @@ export interface McpPeerHelloMessage {
   type: "mcp_hello";
   sessionId: string;
   displayName: string;
+  preferredProfile?: string;
 }
 
 export interface McpPeerToolCallMessage {

@@ -9,7 +9,8 @@ import { McpBridgeClient } from "./bridge-client.js";
 
 async function startMcpServer(): Promise<void> {
   const bridgeClient = new McpBridgeClient({
-    displayName: process.env.AGY_TAB_GROUP_NAME ?? "Antigravity"
+    displayName: process.env.AGY_TAB_GROUP_NAME ?? "Antigravity",
+    preferredProfile: process.env.AGY_BROWSER_PROFILE
   });
   void bridgeClient.warmup();
 

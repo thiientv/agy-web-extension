@@ -22,6 +22,16 @@ await build({
   sourcemap: true
 });
 
+await build({
+  entryPoints: [join(rootDir, "src/extension/popup.ts")],
+  outfile: join(extOutDir, "popup.js"),
+  bundle: true,
+  format: "esm",
+  platform: "browser",
+  target: "chrome120",
+  sourcemap: true
+});
+
 cpSync(join(rootDir, "src/extension/static"), extOutDir, { recursive: true });
 
 const manifest = {
@@ -38,6 +48,7 @@ const manifest = {
   },
   action: {
     default_title: "Antigravity Browser Control",
+    default_popup: "popup.html",
     default_icon: {
       16: "icon-16.png",
       32: "icon-32.png",
@@ -60,7 +71,9 @@ const manifest = {
     "webNavigation",
     "offscreen",
     "unlimitedStorage",
-    "downloads"
+    "downloads",
+    "identity",
+    "identity.email"
   ],
   host_permissions: ["<all_urls>"],
   content_security_policy: {

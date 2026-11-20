@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Antigravity Browser Control</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #111827;
+        --muted: #6b7280;
+        --border: #e5e7eb;
+        --surface: #f9fafb;
+        --accent: #ea580c;
+        --accent-hover: #c2410c;
+        --ok: #16a34a;
+        --err: #dc2626;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #111827;
+          --fg: #f3f4f6;
+          --muted: #9ca3af;
+          --border: #374151;
+          --surface: #1f2937;
+          --accent: #f97316;
+          --accent-hover: #ea580c;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 14px;
+        width: 310px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 13px;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      .header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 12px;
+      }
+      .title {
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 3px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+      }
+      .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--err);
+      }
+      .dot.connected {
+        background: var(--ok);
+      }
+      .field {
+        margin-bottom: 10px;
+      }
+      label {
+        display: block;
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--muted);
+        margin-bottom: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+      }
+      input[type="text"] {
+        flex: 1;
+        min-width: 0;
+        padding: 6px 8px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--fg);
+        font-size: 13px;
+      }
+      button {
+        padding: 6px 12px;
+        border-radius: 6px;
+        border: none;
+        background: var(--accent);
+        color: #ffffff;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:hover {
+        background: var(--accent-hover);
+      }
+      .meta {
+        font-size: 12px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        word-break: break-all;
+      }
+      .hint {
+        margin-top: 10px;
+        font-size: 11px;
+        color: var(--muted);
+        line-height: 1.4;
+      }
+      .status-msg {
+        min-height: 16px;
+        margin-top: 6px;
+        font-size: 11px;
+        color: var(--ok);
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <div class="title">Antigravity Browser</div>
+      <div class="badge">
+        <span id="statusDot" class="dot"></span>
+        <span id="statusText">Checking...</span>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="profileNameInput">Profile Name</label>
+      <div class="row">
+        <input id="profileNameInput" type="text" placeholder="e.g. work, personal" />
+        <button id="saveBtn" type="button">Save</button>
+      </div>
+      <div id="saveStatus" class="status-msg"></div>
+    </div>
+
+    <div class="field">
+      <label>Profile ID</label>
+      <div id="profileIdValue" class="meta">-</div>
+    </div>
+
+    <div class="field" id="emailField" style="display: none">
+      <label>Chrome Account</label>
+      <div id="profileEmailValue" class="meta">-</div>
+    </div>
+
+    <div class="hint">
+      Use <code>tabs_context_mcp({ profile: "&lt;name&gt;" })</code> or set
+      <code>AGY_BROWSER_PROFILE</code> to target this Chrome profile.
+    </div>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

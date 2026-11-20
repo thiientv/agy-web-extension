@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import {
   DEFAULT_BRIDGE_HOST,
   DEFAULT_BRIDGE_PORT,
+  type ConnectedProfileSummary,
   type ExtensionInboundMessage,
   type ExtensionOutboundMessage,
   type McpPeerInboundMessage,
@@ -17,15 +19,93 @@ export interface BridgeHubOptions {
   toolTimeoutMs?: number;
 }
 
+interface ConnectedExtension {
+  socket: WebSocket;
+  profileId: string;
+  profileName: string;
+  profileEmail?: string;
+  browserName: string;
+  extensionVersion: string;
+  connectedAt: number;
+  lastFocusedAt: number;
+}
+
 interface ConnectedMcpPeer {
   socket: WebSocket;
   sessionId: string;
   displayName: string;
+  preferredProfile?: string;
+  boundProfileId: string | null;
 }
 
 interface PendingToolCall {
   peer: ConnectedMcpPeer;
+  profileId: string;
   timer: NodeJS.Timeout;
+}
+
+interface ExtensionWaiter {
+  check: () => ConnectedExtension | null;
+  resolve: (ext: ConnectedExtension | null) => void;
+  timer: NodeJS.Timeout;
+}
+
+type ProfileMatchResult =
+  | { extension: ConnectedExtension }
+  | { error: string };
+
+function toProfileSummary(ext: ConnectedExtension): ConnectedProfileSummary {
+  return {
+    profileId: ext.profileId,
+    profileName: ext.profileName,
+    ...(ext.profileEmail ? { profileEmail: ext.profileEmail } : {}),
+    browserName: ext.browserName,
+    extensionVersion: ext.extensionVersion,
+    connectedAt: ext.connectedAt,
+    lastFocusedAt: ext.lastFocusedAt
+  };
+}
+
+function formatProfileList(profiles: ConnectedProfileSummary[]): string {
+  if (profiles.length === 0) {
+    return "none";
+  }
+  return profiles
+    .map((p) => {
+      const emailPart = p.profileEmail ? `, email=${p.profileEmail}` : "";
+      return `${p.profileName} (id=${p.profileId}${emailPart})`;
+    })
+    .join("; ");
+}
+
+function isContextToolName(toolName: string): boolean {
+  return toolName === "tabs_context_mcp" || toolName === "tabs_context";
+}
+
+function matchProfileExact(ext: ConnectedExtension, normalizedQuery: string): boolean {
+  if (ext.profileId.toLowerCase() === normalizedQuery) {
+    return true;
+  }
+  if (ext.profileName.toLowerCase() === normalizedQuery) {
+    return true;
+  }
+  if (ext.profileEmail && ext.profileEmail.toLowerCase() === normalizedQuery) {
+    return true;
+  }
+  return false;
+}
+
+function matchProfileSubstring(ext: ConnectedExtension, normalizedQuery: string): boolean {
+  if (ext.profileId.toLowerCase().includes(normalizedQuery)) {
+    return true;
+  }
+  if (ext.profileName.toLowerCase().includes(normalizedQuery)) {
+    return true;
+  }
+  if (ext.profileEmail && ext.profileEmail.toLowerCase().includes(normalizedQuery)) {
+    return true;
+  }
+  return false;
 }
 
 export class BridgeHubServer {
@@ -35,8 +115,9 @@ export class BridgeHubServer {
   private readonly toolTimeoutMs: number;
   private httpServer: HttpServer | null = null;
   private wss: WebSocketServer | null = null;
-  private extensionSocket: WebSocket | null = null;
-  private extensionWaiters: Array<(sock: WebSocket | null) => void> = [];
+  private readonly extensions = new Map<string, ConnectedExtension>();
+  private readonly socketToProfileId = new Map<WebSocket, string>();
+  private readonly extensionWaiters: ExtensionWaiter[] = [];
   private readonly peers = new Map<WebSocket, ConnectedMcpPeer>();
   private readonly pendingCalls = new Map<string, PendingToolCall>();
   private pingInterval: NodeJS.Timeout | null = null;
@@ -49,11 +130,37 @@ export class BridgeHubServer {
     this.toolTimeoutMs = options.toolTimeoutMs ?? 90000;
   }
 
-  private sendToExtension(msg: ExtensionInboundMessage): boolean {
-    if (!this.extensionSocket || this.extensionSocket.readyState !== WebSocket.OPEN) {
+  private getOpenExtensions(): ConnectedExtension[] {
+    const open: ConnectedExtension[] = [];
+    for (const ext of this.extensions.values()) {
+      if (ext.socket.readyState === WebSocket.OPEN) {
+        open.push(ext);
+      }
+    }
+    return open;
+  }
+
+  private listConnectedProfileSummaries(): ConnectedProfileSummary[] {
+    return this.getOpenExtensions()
+      .sort((a, b) => b.lastFocusedAt - a.lastFocusedAt || b.connectedAt - a.connectedAt)
+      .map(toProfileSummary);
+  }
+
+  private countPeersForProfile(profileId: string): number {
+    let count = 0;
+    for (const peer of this.peers.values()) {
+      if (peer.boundProfileId === profileId) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  private sendToExtension(ext: ConnectedExtension, msg: ExtensionInboundMessage): boolean {
+    if (ext.socket.readyState !== WebSocket.OPEN) {
       return false;
     }
-    this.extensionSocket.send(JSON.stringify(msg));
+    ext.socket.send(JSON.stringify(msg));
     return true;
   }
 
@@ -63,30 +170,67 @@ export class BridgeHubServer {
     }
   }
 
-  private waitForExtension(): Promise<WebSocket | null> {
-    if (this.extensionSocket && this.extensionSocket.readyState === WebSocket.OPEN) {
-      return Promise.resolve(this.extensionSocket);
+  private notifyExtensionWaiters(): void {
+    for (let i = this.extensionWaiters.length - 1; i >= 0; i -= 1) {
+      const waiter = this.extensionWaiters[i];
+      if (!waiter) {
+        continue;
+      }
+      const matched = waiter.check();
+      if (matched) {
+        this.extensionWaiters.splice(i, 1);
+        clearTimeout(waiter.timer);
+        waiter.resolve(matched);
+      }
+    }
+  }
+
+  private waitForExtension(
+    check: () => ConnectedExtension | null
+  ): Promise<ConnectedExtension | null> {
+    const immediate = check();
+    if (immediate) {
+      return Promise.resolve(immediate);
     }
     if (this.extensionWaitMs <= 0) {
       return Promise.resolve(null);
     }
     return new Promise((resolve) => {
-      const waiter = (sock: WebSocket | null): void => {
-        clearTimeout(timer);
-        resolve(sock);
+      const waiter: ExtensionWaiter = {
+        check,
+        resolve,
+        timer: setTimeout(() => {
+          const idx = this.extensionWaiters.indexOf(waiter);
+          if (idx !== -1) {
+            this.extensionWaiters.splice(idx, 1);
+          }
+          resolve(check());
+        }, this.extensionWaitMs)
       };
-      const timer = setTimeout(() => {
-        const idx = this.extensionWaiters.indexOf(waiter);
-        if (idx !== -1) {
-          this.extensionWaiters.splice(idx, 1);
-        }
-        resolve(null);
-      }, this.extensionWaitMs);
       this.extensionWaiters.push(waiter);
     });
   }
 
-  private failPendingCallsWithError(message: string): void {
+  private failPendingCallsForProfile(profileId: string, message: string): void {
+    const entries = [...this.pendingCalls.entries()];
+    for (const [toolUseId, pending] of entries) {
+      if (pending.profileId !== profileId) {
+        continue;
+      }
+      this.pendingCalls.delete(toolUseId);
+      clearTimeout(pending.timer);
+      this.sendToPeer(pending.peer, {
+        type: "mcp_tool_result",
+        toolUseId,
+        result: {
+          isError: true,
+          content: [{ type: "text", text: message }]
+        }
+      });
+    }
+  }
+
+  private failAllPendingCalls(message: string): void {
     const entries = [...this.pendingCalls.entries()];
     this.pendingCalls.clear();
     for (const [toolUseId, pending] of entries) {
@@ -102,29 +246,181 @@ export class BridgeHubServer {
     }
   }
 
-  private handleExtensionConnection(ws: WebSocket): void {
-    if (this.extensionSocket && this.extensionSocket !== ws) {
-      try {
-        this.extensionSocket.close(1000, "replaced");
-      } catch {
-        // Ignore close error on stale socket.
+  private resolveExtensionByQuery(query: string): ProfileMatchResult {
+    const open = this.getOpenExtensions();
+    const normalized = query.trim().toLowerCase();
+    const exactMatches = open.filter((ext) => matchProfileExact(ext, normalized));
+    if (exactMatches.length === 1 && exactMatches[0]) {
+      return { extension: exactMatches[0] };
+    }
+    if (exactMatches.length > 1) {
+      return {
+        error: `Profile selector "${query}" matched multiple connected Chrome profiles: ${formatProfileList(
+          exactMatches.map(toProfileSummary)
+        )}. Specify the exact profileId to disambiguate.`
+      };
+    }
+
+    const partialMatches = open.filter((ext) => matchProfileSubstring(ext, normalized));
+    if (partialMatches.length === 1 && partialMatches[0]) {
+      return { extension: partialMatches[0] };
+    }
+    if (partialMatches.length > 1) {
+      return {
+        error: `Profile selector "${query}" is ambiguous and matched: ${formatProfileList(
+          partialMatches.map(toProfileSummary)
+        )}. Specify a more specific profile name, email, or profileId.`
+      };
+    }
+
+    return {
+      error: `Chrome profile "${query}" is not connected. Connected profiles: ${formatProfileList(
+        this.listConnectedProfileSummaries()
+      )}.`
+    };
+  }
+
+  private pickDefaultExtension(): ConnectedExtension | null {
+    const open = this.getOpenExtensions();
+    if (open.length === 0) {
+      return null;
+    }
+    open.sort((a, b) => b.lastFocusedAt - a.lastFocusedAt || b.connectedAt - a.connectedAt);
+    return open[0] ?? null;
+  }
+
+  private bindPeerToExtension(peer: ConnectedMcpPeer, targetExt: ConnectedExtension): void {
+    const previousProfileId = peer.boundProfileId;
+    if (previousProfileId === targetExt.profileId) {
+      return;
+    }
+    peer.boundProfileId = targetExt.profileId;
+
+    if (previousProfileId) {
+      const prevExt = this.extensions.get(previousProfileId);
+      if (prevExt && prevExt.socket.readyState === WebSocket.OPEN) {
+        this.sendToExtension(prevExt, {
+          type: "peer_disconnected",
+          sessionId: peer.sessionId,
+          remainingPeers: this.countPeersForProfile(previousProfileId)
+        });
       }
     }
-    this.extensionSocket = ws;
 
-    const waiters = this.extensionWaiters.splice(0, this.extensionWaiters.length);
-    for (const waiter of waiters) {
-      waiter(ws);
+    this.sendToExtension(targetExt, {
+      type: "peer_connected",
+      sessionId: peer.sessionId,
+      displayName: peer.displayName,
+      activePeers: this.countPeersForProfile(targetExt.profileId)
+    });
+  }
+
+  private handleExtensionHello(
+    ws: WebSocket,
+    msg: Extract<ExtensionOutboundMessage, { type: "extension_hello" }>
+  ): void {
+    const currentId = this.socketToProfileId.get(ws);
+    if (!currentId) {
+      return;
+    }
+    const ext = this.extensions.get(currentId);
+    if (!ext || ext.socket !== ws) {
+      return;
+    }
+
+    const nextId =
+      typeof msg.profileId === "string" && msg.profileId.trim()
+        ? msg.profileId.trim()
+        : currentId;
+
+    if (nextId !== currentId) {
+      const existingSameProfile = this.extensions.get(nextId);
+      if (existingSameProfile && existingSameProfile.socket !== ws) {
+        this.socketToProfileId.delete(existingSameProfile.socket);
+        this.failPendingCallsForProfile(
+          nextId,
+          "Chrome extension reconnected for this profile while executing tool call."
+        );
+        try {
+          existingSameProfile.socket.close(1000, "replaced");
+        } catch {
+          // Ignore close error on stale socket.
+        }
+      }
+      this.extensions.delete(currentId);
+      ext.profileId = nextId;
+      this.extensions.set(nextId, ext);
+      this.socketToProfileId.set(ws, nextId);
+    }
+
+    ext.extensionVersion = msg.extensionVersion || ext.extensionVersion;
+    ext.browserName = msg.browserName || ext.browserName;
+    if (typeof msg.profileEmail === "string" && msg.profileEmail.trim()) {
+      ext.profileEmail = msg.profileEmail.trim();
+    }
+    if (typeof msg.profileName === "string" && msg.profileName.trim()) {
+      ext.profileName = msg.profileName.trim();
+    } else if (!ext.profileName || ext.profileName === currentId) {
+      ext.profileName = ext.profileEmail || ext.profileId;
+    }
+    if (typeof msg.lastFocusedAt === "number" && Number.isFinite(msg.lastFocusedAt)) {
+      ext.lastFocusedAt = msg.lastFocusedAt;
     }
 
     for (const peer of this.peers.values()) {
-      this.sendToExtension({
-        type: "peer_connected",
-        sessionId: peer.sessionId,
-        displayName: peer.displayName,
-        activePeers: this.peers.size
-      });
+      if (peer.boundProfileId === ext.profileId) {
+        this.sendToExtension(ext, {
+          type: "peer_connected",
+          sessionId: peer.sessionId,
+          displayName: peer.displayName,
+          activePeers: this.countPeersForProfile(ext.profileId)
+        });
+      }
     }
+
+    this.notifyExtensionWaiters();
+  }
+
+  private handleExtensionProfileUpdate(
+    ws: WebSocket,
+    msg: Extract<ExtensionOutboundMessage, { type: "extension_profile_update" }>
+  ): void {
+    const profileId = this.socketToProfileId.get(ws);
+    if (!profileId) {
+      return;
+    }
+    const ext = this.extensions.get(profileId);
+    if (!ext || ext.socket !== ws) {
+      return;
+    }
+
+    if (typeof msg.profileEmail === "string") {
+      ext.profileEmail = msg.profileEmail.trim() || undefined;
+    }
+    if (typeof msg.profileName === "string" && msg.profileName.trim()) {
+      ext.profileName = msg.profileName.trim();
+    }
+    if (typeof msg.lastFocusedAt === "number" && Number.isFinite(msg.lastFocusedAt)) {
+      ext.lastFocusedAt = msg.lastFocusedAt;
+    }
+    this.notifyExtensionWaiters();
+  }
+
+  private handleExtensionConnection(ws: WebSocket): void {
+    const now = Date.now();
+    const provisionalId = `profile_${randomUUID().slice(0, 8)}`;
+    const ext: ConnectedExtension = {
+      socket: ws,
+      profileId: provisionalId,
+      profileName: provisionalId,
+      browserName: "Chrome",
+      extensionVersion: "unknown",
+      connectedAt: now,
+      lastFocusedAt: now
+    };
+    this.extensions.set(provisionalId, ext);
+    this.socketToProfileId.set(ws, provisionalId);
+    this.notifyExtensionWaiters();
 
     ws.on("message", (raw) => {
       let parsed: ExtensionOutboundMessage;
@@ -135,7 +431,15 @@ export class BridgeHubServer {
       }
 
       if (parsed.type === "ping") {
-        this.sendToExtension({ type: "pong" });
+        this.sendToExtension(ext, { type: "pong" });
+        return;
+      }
+      if (parsed.type === "extension_hello") {
+        this.handleExtensionHello(ws, parsed);
+        return;
+      }
+      if (parsed.type === "extension_profile_update") {
+        this.handleExtensionProfileUpdate(ws, parsed);
         return;
       }
       if (parsed.type === "tool_result") {
@@ -154,13 +458,102 @@ export class BridgeHubServer {
     });
 
     ws.on("close", () => {
-      if (this.extensionSocket === ws) {
-        this.extensionSocket = null;
-        this.failPendingCallsWithError(
-          "Chrome extension disconnected while executing tool call."
+      const profileId = this.socketToProfileId.get(ws);
+      this.socketToProfileId.delete(ws);
+      if (!profileId) {
+        return;
+      }
+      const current = this.extensions.get(profileId);
+      if (current && current.socket === ws) {
+        this.extensions.delete(profileId);
+        this.failPendingCallsForProfile(
+          profileId,
+          `Chrome extension for profile "${current.profileName}" (${profileId}) disconnected while executing tool call.`
         );
       }
     });
+  }
+
+  private async resolveTargetExtension(
+    peer: ConnectedMcpPeer,
+    toolName: string,
+    args: Record<string, unknown>
+  ): Promise<ProfileMatchResult> {
+    const requestedProfile =
+      typeof args.profile === "string" && args.profile.trim() ? args.profile.trim() : undefined;
+    const isContextTool = isContextToolName(toolName);
+
+    if (requestedProfile) {
+      const matched = await this.waitForExtension(() => {
+        const res = this.resolveExtensionByQuery(requestedProfile);
+        return "extension" in res ? res.extension : null;
+      });
+      if (matched) {
+        this.bindPeerToExtension(peer, matched);
+        return { extension: matched };
+      }
+      if (this.getOpenExtensions().length === 0) {
+        return {
+          error:
+            "Antigravity Chrome extension is not connected. Make sure Google Chrome is open and the unpacked extension in dist/extension is enabled."
+        };
+      }
+      return this.resolveExtensionByQuery(requestedProfile);
+    }
+
+    if (peer.boundProfileId) {
+      const existing = this.extensions.get(peer.boundProfileId);
+      if (existing && existing.socket.readyState === WebSocket.OPEN) {
+        return { extension: existing };
+      }
+
+      if (!isContextTool) {
+        const reconnected = await this.waitForExtension(() => {
+          if (!peer.boundProfileId) {
+            return null;
+          }
+          const candidate = this.extensions.get(peer.boundProfileId);
+          return candidate && candidate.socket.readyState === WebSocket.OPEN ? candidate : null;
+        });
+        if (reconnected) {
+          return { extension: reconnected };
+        }
+        const connectedList = formatProfileList(this.listConnectedProfileSummaries());
+        return {
+          error: `Chrome profile "${peer.boundProfileId}" bound to this session is no longer connected. Connected profiles: ${connectedList}. Call tabs_context_mcp with a connected \`profile\` to switch.`
+        };
+      }
+    }
+
+    if (peer.preferredProfile) {
+      const preferredQuery = peer.preferredProfile;
+      const matched = await this.waitForExtension(() => {
+        const res = this.resolveExtensionByQuery(preferredQuery);
+        return "extension" in res ? res.extension : null;
+      });
+      if (matched) {
+        this.bindPeerToExtension(peer, matched);
+        return { extension: matched };
+      }
+      if (this.getOpenExtensions().length === 0) {
+        return {
+          error:
+            "Antigravity Chrome extension is not connected. Make sure Google Chrome is open and the unpacked extension in dist/extension is enabled."
+        };
+      }
+      return this.resolveExtensionByQuery(preferredQuery);
+    }
+
+    const fallback = await this.waitForExtension(() => this.pickDefaultExtension());
+    if (!fallback) {
+      return {
+        error:
+          "Antigravity Chrome extension is not connected. Make sure Google Chrome is open and the unpacked extension in dist/extension is enabled."
+      };
+    }
+
+    this.bindPeerToExtension(peer, fallback);
+    return { extension: fallback };
   }
 
   private async dispatchPeerToolCall(
@@ -169,17 +562,11 @@ export class BridgeHubServer {
     toolName: string,
     args: Record<string, unknown>
   ): Promise<void> {
-    const ext = await this.waitForExtension();
-    if (!ext || ext.readyState !== WebSocket.OPEN) {
+    const resolved = await this.resolveTargetExtension(peer, toolName, args);
+    if ("error" in resolved) {
       const errorResult: McpToolCallResult = {
         isError: true,
-        content: [
-          {
-            type: "text",
-            text:
-              "Antigravity Chrome extension is not connected. Make sure Google Chrome is open and the unpacked extension in dist/extension is enabled."
-          }
-        ]
+        content: [{ type: "text", text: resolved.error }]
       };
       this.sendToPeer(peer, {
         type: "mcp_tool_result",
@@ -189,6 +576,7 @@ export class BridgeHubServer {
       return;
     }
 
+    const targetExt = resolved.extension;
     const timer = setTimeout(() => {
       this.pendingCalls.delete(toolUseId);
       this.sendToPeer(peer, {
@@ -199,22 +587,29 @@ export class BridgeHubServer {
           content: [
             {
               type: "text",
-              text: `Timed out waiting for Chrome extension response on tool "${toolName}".`
+              text: `Timed out waiting for Chrome extension response on tool "${toolName}" (profile "${targetExt.profileName}").`
             }
           ]
         }
       });
     }, this.toolTimeoutMs);
 
-    this.pendingCalls.set(toolUseId, { peer, timer });
-    this.sendToExtension({
+    this.pendingCalls.set(toolUseId, {
+      peer,
+      profileId: targetExt.profileId,
+      timer
+    });
+
+    this.sendToExtension(targetExt, {
       type: "tool_call",
       toolUseId,
       toolName,
       args,
       sessionScope: {
         sessionId: peer.sessionId,
-        displayName: peer.displayName
+        displayName: peer.displayName,
+        activeProfile: toProfileSummary(targetExt),
+        connectedProfiles: this.listConnectedProfileSummaries()
       }
     });
   }
@@ -223,7 +618,8 @@ export class BridgeHubServer {
     const peer: ConnectedMcpPeer = {
       socket: ws,
       sessionId: `session_${Math.random().toString(36).slice(2, 10)}`,
-      displayName: "Antigravity"
+      displayName: "Antigravity",
+      boundProfileId: null
     };
     this.peers.set(ws, peer);
 
@@ -243,12 +639,9 @@ export class BridgeHubServer {
       if (parsed.type === "mcp_hello") {
         peer.sessionId = parsed.sessionId;
         peer.displayName = parsed.displayName;
-        this.sendToExtension({
-          type: "peer_connected",
-          sessionId: peer.sessionId,
-          displayName: peer.displayName,
-          activePeers: this.peers.size
-        });
+        if (typeof parsed.preferredProfile === "string" && parsed.preferredProfile.trim()) {
+          peer.preferredProfile = parsed.preferredProfile.trim();
+        }
         return;
       }
 
@@ -271,12 +664,15 @@ export class BridgeHubServer {
           this.pendingCalls.delete(toolUseId);
         }
       }
-      if (existing) {
-        this.sendToExtension({
-          type: "peer_disconnected",
-          sessionId: existing.sessionId,
-          remainingPeers: this.peers.size
-        });
+      if (existing?.boundProfileId) {
+        const boundExt = this.extensions.get(existing.boundProfileId);
+        if (boundExt && boundExt.socket.readyState === WebSocket.OPEN) {
+          this.sendToExtension(boundExt, {
+            type: "peer_disconnected",
+            sessionId: existing.sessionId,
+            remainingPeers: this.countPeersForProfile(existing.boundProfileId)
+          });
+        }
       }
     });
   }
@@ -301,14 +697,14 @@ export class BridgeHubServer {
 
     const server = createServer((req, res) => {
       if (req.url === "/health") {
+        const connectedProfiles = this.listConnectedProfileSummaries();
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
             ok: true,
-            extensionConnected:
-              this.extensionSocket !== null &&
-              this.extensionSocket.readyState === WebSocket.OPEN,
-            activeMcpPeers: this.peers.size
+            extensionConnected: connectedProfiles.length > 0,
+            activeMcpPeers: this.peers.size,
+            connectedProfiles
           })
         );
         return;
@@ -336,7 +732,9 @@ export class BridgeHubServer {
     this.wss = wss;
 
     this.pingInterval = setInterval(() => {
-      this.sendToExtension({ type: "ping" });
+      for (const ext of this.getOpenExtensions()) {
+        this.sendToExtension(ext, { type: "ping" });
+      }
     }, 20000);
 
     return this.boundPort;
@@ -348,14 +746,17 @@ export class BridgeHubServer {
       this.pingInterval = null;
     }
     for (const waiter of this.extensionWaiters.splice(0, this.extensionWaiters.length)) {
-      waiter(null);
+      clearTimeout(waiter.timer);
+      waiter.resolve(null);
     }
-    this.failPendingCallsWithError("Bridge hub stopped.");
+    this.failAllPendingCalls("Bridge hub stopped.");
 
-    if (this.extensionSocket) {
-      this.extensionSocket.terminate();
-      this.extensionSocket = null;
+    for (const ext of this.extensions.values()) {
+      ext.socket.terminate();
     }
+    this.extensions.clear();
+    this.socketToProfileId.clear();
+
     for (const peer of this.peers.keys()) {
       peer.terminate();
     }

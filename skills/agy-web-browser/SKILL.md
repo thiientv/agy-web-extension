@@ -18,7 +18,8 @@ In Antigravity (`agy`), `agy-browser` tools are lazy-loaded. Invoke them via `ca
 ## Standard Session Lifecycle
 
 1. **Initialize session Tab Group once per task**:
-   Call `tabs_context_mcp` with `{"createIfEmpty": true}`.
+   Call `tabs_context_mcp` with `{"createIfEmpty": true}` (or `{"createIfEmpty": true, "profile": "<name|email|profileId>"}` when multiple Chrome profiles are open).
+   - The response includes `Active Profile` and `Connected Profiles`. Once a session selects a profile, all subsequent tool calls in that session remain pinned to that Chrome profile without interfering with other open profiles.
    - If this session had no group yet, `createIfEmpty: true` **already creates** the Tab Group and one fresh background tab (`chrome://newtab/`, `active: false`). Reuse that returned `Current Tab ID` directly — do **not** call `tabs_create_mcp` immediately afterward or you will leave an unused blank tab open.
    - Call `tabs_create_mcp` only when you need an **additional** tab in an already-populated group.
 2. **Navigate**:
@@ -41,7 +42,7 @@ In Antigravity (`agy`), `agy-browser` tools are lazy-loaded. Invoke them via `ca
 
 | Tool | Purpose | Key Arguments |
 | :--- | :--- | :--- |
-| `tabs_context_mcp` | Get or initialize session's isolated Tab Group | `createIfEmpty?: boolean` |
+| `tabs_context_mcp` | Get or initialize session's isolated Tab Group & select Chrome profile | `createIfEmpty?: boolean`, `profile?: string` |
 | `tabs_create_mcp` | Open an additional background tab (`active: false`) in group | *(none)* |
 | `tabs_close_mcp` | Close a tab in this session's Tab Group | `tabId: number` |
 | `navigate` | Load URL or `"back"` / `"forward"` | `tabId: number`, `url: string`, `force?: boolean` |

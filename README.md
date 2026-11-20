@@ -8,7 +8,7 @@ Non-intrusive Chrome browser automation for **Antigravity (`agy`)** via isolated
 - **Background Focus Emulation + CDP Input**: Uses `chrome.debugger` (`1.3`) with `Emulation.setFocusEmulationEnabled({ enabled: true })`, automatic background audio mute protection, `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` / `Input.insertText`, and `Page.captureScreenshot` — background tabs respond as if focused without touching your OS cursor or keyboard focus.
 - **Original Visuals & In-Page Stop Kept**: Preserves the pulsing orange glow border (`#D97757`), smooth curved phantom cursor with click ripple rings, and the in-page **Stop Antigravity** button whenever you peek inside an agent-controlled tab (automatically hidden during screenshots).
 - **Personal Zero-Prompt Mode**: All domain permission dialogs, OAuth sign-in gates, Meet bots, and sidepanel bloat are stripped out for instant personal automation across `<all_urls>`.
-- **Multi-Session Concurrent Hub**: Multiple `agy` terminals can run browser tasks simultaneously via the local WebSocket hub (`127.0.0.1:18765`), each managing its own color-coded Tab Group.
+- **Multi-Session & Multi-Profile Concurrent Hub**: Multiple `agy` terminals and multiple Chrome profiles can run simultaneously over the single local WebSocket hub (`127.0.0.1:18765`). Click the extension icon in each Chrome profile to assign a custom profile name (e.g. `work`, `personal`), then pass `tabs_context_mcp({ profile: "work", createIfEmpty: true })` or set `AGY_BROWSER_PROFILE` to pin a session to that profile.
 
 ---
 
@@ -62,7 +62,7 @@ See [docs/skill-installation.md](./docs/skill-installation.md) for manual instal
 
 | Tool | Description |
 | :--- | :--- |
-| `tabs_context_mcp` | List or create (`createIfEmpty: true`) this session's isolated Chrome Tab Group |
+| `tabs_context_mcp` | List or create (`createIfEmpty: true`) this session's isolated Chrome Tab Group, list connected Chrome profiles, and optionally select/switch Chrome `profile` |
 | `tabs_create_mcp` | Create a new background tab (`active: false`) inside this session's Tab Group |
 | `tabs_close_mcp` | Close a tab belonging to this session's Tab Group |
 | `navigate` | Navigate a tab to a URL or `"back"` / `"forward"` (supports `force: true` for `beforeunload`) |

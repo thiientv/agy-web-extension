@@ -17,6 +17,7 @@ export interface McpBridgeClientOptions {
   port?: number;
   sessionId?: string;
   displayName?: string;
+  preferredProfile?: string;
   autoSpawnDaemon?: boolean;
   daemonScriptPath?: string;
   callTimeoutMs?: number;
@@ -81,6 +82,7 @@ export class McpBridgeClient {
   private readonly port: number;
   private readonly sessionId: string;
   private readonly displayName: string;
+  private readonly preferredProfile?: string;
   private readonly autoSpawnDaemon: boolean;
   private readonly daemonScriptPath: string;
   private readonly callTimeoutMs: number;
@@ -97,6 +99,11 @@ export class McpBridgeClient {
     this.port = options.port ?? Number(process.env.AGY_BRIDGE_PORT ?? DEFAULT_BRIDGE_PORT);
     this.sessionId = options.sessionId ?? `agy_${randomUUID().slice(0, 8)}`;
     this.displayName = options.displayName ?? "Antigravity";
+    const rawPreferredProfile = options.preferredProfile ?? process.env.AGY_BROWSER_PROFILE;
+    this.preferredProfile =
+      typeof rawPreferredProfile === "string" && rawPreferredProfile.trim()
+        ? rawPreferredProfile.trim()
+        : undefined;
     this.autoSpawnDaemon = options.autoSpawnDaemon ?? true;
     const currentDir = dirname(fileURLToPath(import.meta.url));
     this.daemonScriptPath = options.daemonScriptPath ?? join(currentDir, "daemon.js");
@@ -137,7 +144,8 @@ export class McpBridgeClient {
         this.send(ws, {
           type: "mcp_hello",
           sessionId: this.sessionId,
-          displayName: this.displayName
+          displayName: this.displayName,
+          ...(this.preferredProfile ? { preferredProfile: this.preferredProfile } : {})
         });
 
         ws.on("message", (raw) => {

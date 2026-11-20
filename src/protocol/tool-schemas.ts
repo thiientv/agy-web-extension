@@ -12,7 +12,7 @@ export const BROWSER_TOOL_SCHEMAS: ReadonlyArray<ToolDefinitionSchema> = [
   {
     name: "tabs_context_mcp",
     description:
-      "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
+      "Get context information about the current MCP tab group and connected Chrome profiles. Returns all tab IDs inside the group if it exists, along with the active Chrome profile and all connected profiles. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. When multiple Chrome profiles are open, pass `profile` to select or switch the Chrome profile for this session. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
     inputSchema: {
       type: "object",
       properties: {
@@ -20,6 +20,11 @@ export const BROWSER_TOOL_SCHEMAS: ReadonlyArray<ToolDefinitionSchema> = [
           type: "boolean",
           description:
             "Creates a new MCP tab group if none exists, containing a background tab (active: false) without disturbing the user's focused tab or mouse cursor. If an MCP tab group already exists for this session, this parameter has no effect."
+        },
+        profile: {
+          type: "string",
+          description:
+            "Optional Chrome profile selector (matches the custom profile name set in the extension popup, the Google account email of the profile, or its profileId). Pins this session to the selected Chrome profile so subsequent tool calls stay on that profile. Omit to use the currently bound or most recently focused Chrome profile."
         }
       },
       required: []

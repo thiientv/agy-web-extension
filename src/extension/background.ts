@@ -10,6 +10,13 @@ import { ToolExecutor } from "./tool-executor.js";
 
 const BRIDGE_KEEPALIVE_ALARM = "agy-bridge-keepalive";
 
+interface ProfileIdentity {
+  profileId: string;
+  profileName: string;
+  customProfileName: string;
+  profileEmail?: string;
+}
+
 const tabGroups = new TabGroupManager();
 const cdp = new CdpController();
 const executor = new ToolExecutor(tabGroups, cdp);
@@ -18,6 +25,8 @@ let bridgeSocket: WebSocket | null = null;
 let connecting = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempt = 0;
+let lastFocusedAt = Date.now();
+let cachedIdentity: ProfileIdentity | null = null;
 
 async function getBridgeEndpointUrl(): Promise<string> {
   try {
@@ -31,22 +40,83 @@ async function getBridgeEndpointUrl(): Promise<string> {
   return `ws://${DEFAULT_BRIDGE_HOST}:${DEFAULT_BRIDGE_PORT}/extension`;
 }
 
+async function readChromeProfileEmail(): Promise<string | undefined> {
+  try {
+    if (!chrome.identity || typeof chrome.identity.getProfileUserInfo !== "function") {
+      return undefined;
+    }
+    const info = await chrome.identity.getProfileUserInfo({
+      accountStatus: chrome.identity.AccountStatus.ANY
+    });
+    const email = typeof info?.email === "string" ? info.email.trim() : "";
+    return email || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function getOrCreateProfileIdentity(forceRefresh = false): Promise<ProfileIdentity> {
+  if (cachedIdentity && !forceRefresh) {
+    return cachedIdentity;
+  }
+
+  let profileId = "";
+  let customProfileName = "";
+  try {
+    const stored = await chrome.storage.local.get(["profileId", "profileName"]);
+    if (typeof stored.profileId === "string" && stored.profileId.trim()) {
+      profileId = stored.profileId.trim();
+    }
+    if (typeof stored.profileName === "string" && stored.profileName.trim()) {
+      customProfileName = stored.profileName.trim();
+    }
+  } catch {
+    // Ignore storage read errors and generate a fallback ID.
+  }
+
+  if (!profileId) {
+    const suffix =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID().slice(0, 8)
+        : Math.random().toString(36).slice(2, 10);
+    profileId = `prof_${suffix}`;
+    try {
+      await chrome.storage.local.set({ profileId });
+    } catch {
+      // Ignore storage write errors.
+    }
+  }
+
+  const profileEmail = await readChromeProfileEmail();
+  const profileName = customProfileName || profileEmail || profileId;
+
+  cachedIdentity = {
+    profileId,
+    profileName,
+    customProfileName,
+    ...(profileEmail ? { profileEmail } : {})
+  };
+  return cachedIdentity;
+}
+
 function sendOutbound(msg: ExtensionOutboundMessage): void {
   if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
     bridgeSocket.send(JSON.stringify(msg));
   }
 }
 
-function scheduleReconnect(): void {
-  if (reconnectTimer) {
+async function sendProfileUpdate(): Promise<void> {
+  if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
     return;
   }
-  reconnectAttempt += 1;
-  const delay = Math.min(500 * Math.pow(1.4, Math.min(reconnectAttempt, 8)), 5000);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    void connectBridge();
-  }, Math.round(delay));
+  const identity = await getOrCreateProfileIdentity();
+  sendOutbound({
+    type: "extension_profile_update",
+    profileId: identity.profileId,
+    profileName: identity.profileName,
+    ...(identity.profileEmail ? { profileEmail: identity.profileEmail } : {}),
+    lastFocusedAt
+  });
 }
 
 async function handleInboundMessage(msg: ExtensionInboundMessage): Promise<void> {
@@ -74,6 +144,18 @@ async function handleInboundMessage(msg: ExtensionInboundMessage): Promise<void>
   }
 }
 
+function scheduleReconnect(): void {
+  if (reconnectTimer) {
+    return;
+  }
+  reconnectAttempt += 1;
+  const delay = Math.min(500 * Math.pow(1.4, Math.min(reconnectAttempt, 8)), 5000);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    void connectBridge();
+  }, Math.round(delay));
+}
+
 async function connectBridge(): Promise<void> {
   if (
     connecting ||
@@ -86,7 +168,10 @@ async function connectBridge(): Promise<void> {
 
   connecting = true;
   try {
-    const url = await getBridgeEndpointUrl();
+    const [url, identity] = await Promise.all([
+      getBridgeEndpointUrl(),
+      getOrCreateProfileIdentity()
+    ]);
     const ws = new WebSocket(url);
     bridgeSocket = ws;
 
@@ -96,7 +181,11 @@ async function connectBridge(): Promise<void> {
       sendOutbound({
         type: "extension_hello",
         extensionVersion: chrome.runtime.getManifest().version,
-        browserName: navigator.userAgent
+        browserName: navigator.userAgent,
+        profileId: identity.profileId,
+        profileName: identity.profileName,
+        ...(identity.profileEmail ? { profileEmail: identity.profileEmail } : {}),
+        lastFocusedAt
       });
     };
 
@@ -163,6 +252,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId !== chrome.windows.WINDOW_ID_NONE) {
+    lastFocusedAt = Date.now();
+    void sendProfileUpdate();
+  }
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   void cdp.disposeTab(tabId).catch(() => undefined);
 });
@@ -197,6 +293,44 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
     }
     sendResponse({ success: true });
     return false;
+  }
+
+  if (msg.type === "GET_PROFILE_STATE") {
+    void Promise.all([getOrCreateProfileIdentity(true), getBridgeEndpointUrl()]).then(
+      ([identity, bridgeUrl]) => {
+        sendResponse({
+          success: true,
+          profileId: identity.profileId,
+          profileName: identity.profileName,
+          customProfileName: identity.customProfileName,
+          profileEmail: identity.profileEmail ?? "",
+          bridgeConnected: Boolean(bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN),
+          bridgeUrl
+        });
+      }
+    );
+    return true;
+  }
+
+  if (msg.type === "SET_PROFILE_NAME" && typeof msg.profileName === "string") {
+    const trimmed = msg.profileName.trim();
+    const storageOp = trimmed
+      ? chrome.storage.local.set({ profileName: trimmed })
+      : chrome.storage.local.remove("profileName");
+    void storageOp
+      .then(() => getOrCreateProfileIdentity(true))
+      .then(async (identity) => {
+        await sendProfileUpdate();
+        sendResponse({
+          success: true,
+          profileId: identity.profileId,
+          profileName: identity.profileName,
+          customProfileName: identity.customProfileName,
+          profileEmail: identity.profileEmail ?? "",
+          bridgeConnected: Boolean(bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN)
+        });
+      });
+    return true;
   }
 
   if (msg.type === "SET_BRIDGE_URL" && typeof msg.bridgeUrl === "string") {
